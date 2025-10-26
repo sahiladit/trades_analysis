@@ -37,7 +37,7 @@ A local, real-time analytics dashboard for quantitative research, trading, and s
 git clone <your_repo_url>
 cd <your_repo>
 pip install -r requirements.txt
-python3 app.py or python app.py
+python3 app.py or python app.py or py app.py
 ```
 
 ## 💡 ChatGPT/AI Usage Transparency
