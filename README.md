@@ -47,7 +47,7 @@ Parts of this code, helper scripts, and statistical design were created with the
 - "Write a code to add the data in the CSV file."
 - "Suggest tools to show analytics in easy manner."
 
-Basic prompt eangineering was used which included using """ for input , giving contexts to ChatGPT , using basic English , providing clear goals etc.
+Basic prompt engineering was used which included using """ for input , giving contexts to ChatGPT , using basic English , providing clear goals etc.
 
 ---
 
