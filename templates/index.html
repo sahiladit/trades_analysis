@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Binance Futures Collector — Save NDJSON</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  body { margin: 0; padding: 16px; background: #0b0f14; color: #e6edf3; }
+  .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 16px; padding: 16px; max-width: 980px; margin: 0 auto; }
+  input, button { padding: 10px 16px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color:#e6edf3; }
+  button.primary { background:#0ea5e9; color:#0b0f14; font-weight:600; }
+  .row { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+  .log { background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; height:320px; overflow:auto; white-space:pre; font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #analytics-data {
+    background-color: #162447;
+    border-radius: 12px;
+    padding: 16px;
+    color: #e6edf3;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  }
+  #analytics-data h3 {
+    border-bottom: 2px solid #0ea5e9;
+    padding-bottom: 8px;
+    margin-bottom: 16px;
+  }
+  #alert-message {
+    margin-top: 12px;
+    font-weight: 700;
+    color: red;
+  }
+  /* Hide table section */
+  #analytics-table-section { display: none; }
+</style>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body>
+<div class="card">
+  <h2 style="margin-top:0">Binance Futures Collector — Save NDJSON (no network)</h2>
+  <div class="row">
+    <div>
+      <label>Symbols (comma-separated, lowercase)</label>
+      <input id="symbols" value="btcusdt,ethusdt">
+    </div>
+    <div style="display:flex; gap:8px; align-items:flex-end; justify-content:flex-end">
+      <button id="start" class="primary">Start</button>
+      <button id="stop">Stop</button>
+      <button id="download">Download NDJSON</button>
+      <button id="clear">Clear</button>
+    </div>
+  </div>
+  <p id="stats">Buffered: 0</p>
+  <div class="log" id="log"></div>
+</div>
+<div id="analytics" class="card" style="margin-top:20px;">
+  <h3>Live Analytics</h3>
+  <label for="zscoreThreshold">Z-Score Alert Threshold:</label>
+  <input type="number" id="zscoreThreshold" step="0.1" min="0" value="2" style="width:60px;" />
+  <div id="analytics-data"></div>
+  <div id="alert-message"></div>
+  <button id="download-csv" style="margin-top:14px;">Download Table CSV</button>
+  <div id="analytics-table-section">
+    <table id="stats-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Z-Score</th>
+          <th>Hedge Ratio</th>
+          <th>Spread</th>
+          <th>Rolling Corr</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+<div id="price-plot" style="height:300px;"></div>
+<div id="spread-plot" style="height:300px;"></div>
+<div id="alert-settings">
+  <label for="zscoreThreshold">Set Z-Score Alert Threshold:</label>
+  <input type="number" id="zscoreThreshold" value="2" step="0.1" min="0" max="10" style="margin-left:10px; width:60px"/>
+  <button id="updateAlertBtn" style="margin-left: 12px; cursor:pointer; background:#0ea5e9; color:#0b0f14; border:none; border-radius:4px; padding:4px 10px;">Update</button>
+  <div id="alert-message" style="color:red;"></div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let sockets = [], buffer = [], running = false;
+  let analyticsRunning = false, analyticsInterval = null;
+  const statsArray = [];
+  let alertAlreadyShown = false;
+
+  function fetchAnalytics() {
+    fetch('/api/analytics')
+      .then(response => response.json())
+      .then(data => {
+        if (!data.sym1 || !data.sym2) {
+          $('analytics-data').innerHTML = '<p style="color:#ccc;">Waiting for sufficient data...</p>';
+          Plotly.purge('price-plot');
+          Plotly.purge('spread-plot');
+          renderStatsTable(statsArray);
+          $('alert-message').textContent = '';
+          return;
+        }
+
+        const alertThresholdInput = $('zscoreThreshold');
+        const alertThreshold = alertThresholdInput ? parseFloat(alertThresholdInput.value) : 2;
+        const zScoreVal = data.z_score;
+        const ddStats = getDrawdownAndStreak(statsArray);
+
+        // One-time alert pop-up logic
+        if (Math.abs(zScoreVal) > alertThreshold) {
+          if (!alertAlreadyShown) {
+            alert(`Z-Score Alert! Value (${zScoreVal.toFixed(4)}) has exceeded your threshold of ${alertThreshold}`);
+            alertAlreadyShown = true;
+          }
+        } else {
+          alertAlreadyShown = false;
+        }
+
+        if (Math.abs(zScoreVal) > alertThreshold) {
+          $('alert-message').textContent = `ALERT: Z-Score (${zScoreVal.toFixed(4)}) exceeds threshold (${alertThreshold})`;
+        } else {
+          $('alert-message').textContent = '';
+        }
+
+        $('analytics-data').innerHTML = `
+  <h3>${data.sym1.toUpperCase()} vs ${data.sym2.toUpperCase()}</h3>
+  <p><strong>Hedge Ratio (Beta):</strong> ${data.hedge_beta.toFixed(4)}</p>
+  <p><strong>Last Spread:</strong> ${data.last_spread.toFixed(4)}</p>
+  <p><strong>Z-Score:</strong> <span style="color:${Math.abs(zScoreVal) > alertThreshold ? 'red' : 'limegreen'};">
+    ${zScoreVal.toFixed(4)}</span></p>
+  <p><strong>Rolling Correlation:</strong> ${data.rolling_corr.toFixed(4)}</p>
+  <hr>
+  <div>
+    <strong>Max Drawdown:</strong> ${ddStats.maxDrawdown.toFixed(4)}<br>
+    <strong>Max Win Streak:</strong> ${ddStats.maxWinStreak}<br>
+    <strong>Max Loss Streak:</strong> ${ddStats.maxLossStreak}
+  </div>
+`;
+
+
+        Plotly.newPlot('price-plot', [
+          {x: [...Array(data.prices1.length).keys()], y: data.prices1, name: data.sym1.toUpperCase(), mode: "lines", type: "scatter"},
+          {x: [...Array(data.prices2.length).keys()], y: data.prices2, name: data.sym2.toUpperCase(), mode: "lines", type: "scatter"}
+        ], {
+          title: 'Price Series',
+          margin: { t: 30, b: 40 },
+          xaxis: { title: 'Tick Number' },
+          yaxis: { autorange: true }
+        });
+
+        Plotly.newPlot('spread-plot', [
+          {x: [...Array(data.spread_list.length).keys()], y: data.spread_list, name: 'Spread', mode: 'lines', type: 'scatter'}
+        ], {
+          title: 'Spread Series',
+          margin: { t: 30, b: 40 },
+          xaxis: { title: 'Tick Number' },
+          yaxis: { autorange: true }
+        });
+
+        statsArray.push({
+          time: new Date().toLocaleTimeString(),
+          z_score: zScoreVal,
+          hedge_beta: data.hedge_beta,
+          spread: data.last_spread,
+          rolling_corr: data.rolling_corr
+        });
+        if (statsArray.length > 200) statsArray.shift();
+        renderStatsTable(statsArray);
+
+      })
+      .catch(err => {
+        console.error('Error fetching analytics:', err);
+        $('analytics-data').innerHTML = '<p style="color:red;">Failed to load analytics data.</p>';
+        Plotly.purge('price-plot');
+        Plotly.purge('spread-plot');
+        $('alert-message').textContent = '';
+        renderStatsTable(statsArray);
+      });
+  }
+
+  function renderStatsTable(arr) {
+    const tbody = document.querySelector("#stats-table tbody");
+    tbody.innerHTML = arr.map(stat => `
+      <tr>
+        <td>${stat.time}</td>
+        <td>${stat.z_score.toFixed(4)}</td>
+        <td>${stat.hedge_beta.toFixed(4)}</td>
+        <td>${stat.spread.toFixed(4)}</td>
+        <td>${stat.rolling_corr.toFixed(4)}</td>
+      </tr>
+    `).join("");
+  }
+
+  $('download-csv').onclick = () => {
+    if (statsArray.length === 0) return;
+    const csvHeaders = ["Time","Z-Score","Hedge Ratio","Spread","Rolling Corr"];
+    const csvRows = statsArray.map(stat =>
+      [stat.time, stat.z_score, stat.hedge_beta, stat.spread, stat.rolling_corr].map(v => v !== undefined ? v : '').join(",")
+    );
+    const csv = [csvHeaders.join(","), ...csvRows].join("\n");
+    const blob = new Blob([csv], {type: "text/csv"});
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "analytics_stats.csv";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  function log(m) {
+    const ts = new Date().toISOString();
+    $('log').textContent += `[${ts}] ${m}\n`;
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+
+  function update() {
+    $('stats').textContent = `Buffered: ${buffer.length}`;
+  }
+
+  function normalize(j) {
+    const ts = new Date(j.T || j.E).toISOString();
+    return { symbol: j.s, ts, price: Number(j.p), size: Number(j.q) };
+  }
+
+  $('start').onclick = () => {
+    if (running) return;
+    running = true;
+    const syms = $('symbols').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (!syms.length) {
+      log('No symbols');
+      return;
+    }
+    sockets = syms.map(sym => {
+      const url = `wss://fstream.binance.com/ws/${sym}@trade`;
+      const ws = new WebSocket(url);
+      ws.onopen = () => log(`WS connected: ${sym}`);
+      ws.onmessage = ev => {
+        try {
+          const j = JSON.parse(ev.data);
+          if (j.e === 'trade') {
+            buffer.push(normalize(j));
+            update();
+          }
+        } catch (e) {}
+      };
+      ws.onclose = ev => log(`WS closed ${sym} code=${ev.code}`);
+      ws.onerror = ev => log(`WS error ${sym}`);
+      return ws;
+    });
+    startAnalytics();
+  };
+
+  $('stop').onclick = () => {
+    sockets.forEach(ws => { try { ws.close(1000, 'user stop'); } catch {} });
+    sockets = [];
+    running = false;
+    log('Stopped.');
+    stopAnalytics();
+  };
+
+  $('download').onclick = () => {
+    const ndjson = buffer.map(x => JSON.stringify(x)).join('\n');
+    const blob = new Blob([ndjson], { type: 'application/x-ndjson' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const ts = new Date().toISOString().replace(/:/g, '-');
+    a.download = `ticks_${ts}.ndjson`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
+  $('clear').onclick = () => {
+    buffer = [];
+    update();
+    log('Cleared buffer.');
+  };
+
+  function startAnalytics() {
+    if (!analyticsRunning) {
+      analyticsRunning = true;
+      analyticsInterval = setInterval(fetchAnalytics, 1500);
+      fetchAnalytics();
+    }
+  }
+
+  function stopAnalytics() {
+    if (analyticsRunning) {
+      clearInterval(analyticsInterval);
+      analyticsRunning = false;
+      $('analytics-data').innerHTML = '';
+      Plotly.purge('price-plot');
+      Plotly.purge('spread-plot');
+      renderStatsTable(statsArray);
+      $('alert-message').textContent = '';
+    }
+  }
+  
+    function getDrawdownAndStreak(statsArr) {
+  let maxDD = 0, curDD = 0, peak = 0, pnl = 0;
+  let winStreak = 0, lossStreak = 0, curStreak = 0, last = null;
+  let maxWinStreak = 0, maxLossStreak = 0;
+
+  // Use spread differences for pseudo-PnL example
+  for (let i = 1; i < statsArr.length; ++i) {
+    let diff = statsArr[i].spread - statsArr[i-1].spread;
+    pnl += diff;
+    peak = Math.max(peak, pnl);
+    curDD = peak - pnl;
+    if (curDD > maxDD) maxDD = curDD;
+
+    // For streaks: up = win, down = lose
+    if (diff > 0) {
+      curStreak = (last === 'win') ? curStreak + 1 : 1;
+      last = 'win';
+      maxWinStreak = Math.max(maxWinStreak, curStreak);
+    } else if (diff < 0) {
+      curStreak = (last === 'loss') ? curStreak + 1 : 1;
+      last = 'loss';
+      maxLossStreak = Math.max(maxLossStreak, curStreak);
+    }
+  }
+  return {
+    maxDrawdown: maxDD,
+    maxWinStreak: maxWinStreak,
+    maxLossStreak: maxLossStreak
+  };
+}
+
+})();
+</script>
+</body>
+</html>
